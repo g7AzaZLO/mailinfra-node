@@ -1,0 +1,72 @@
+# Публикация пакета mailinfra в npm.
+#
+# Этот репозиторий — публичное зеркало sdk/node из монорепозитория MailInfra.
+# Его выкладывает sdk/scripts/release-mirror.sh вместе с тегом vX.Y.Z, тег
+# запускает этот workflow. Правки сюда напрямую не вносятся: следующий релиз
+# перезапишет их содержимым монорепозитория.
+#
+# ── Что нужно настроить один раз ────────────────────────────────────────────
+# 1. Settings → Environments → release: Required reviewers — владелец;
+#    Deployment branches and tags — только теги `v*`. Публикация ждёт Approve.
+# 2. Первая версия: npm → Access Tokens → Granular Access Token с правом
+#    publish, секретом окружения release под именем NPM_TOKEN.
+# 3. После первой публикации: npm → пакет mailinfra → Settings → Trusted
+#    Publisher → GitHub Actions: g7AzaZLO/mailinfra-node, release.yml,
+#    environment release. Затем удалить NPM_TOKEN: npm возьмёт OIDC-токен сам.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      # Для trusted publishing и provenance (подпись сборки в Sigstore).
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Сверить версию тега с package.json
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Тег $GITHUB_REF_NAME не совпадает с version=$pkg_version в package.json"
+            exit 1
+          fi
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Тесты
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Сборка
+        run: npm run build
+
+      - name: npm pack (проверка содержимого)
+        run: npm pack --dry-run
+
+      - name: npm с поддержкой trusted publishing
+        # Публикация по OIDC появилась в npm 11.5.1, а в Node 22 идёт npm 10.
+        run: npm install -g npm@^11.5.1
+
+      - name: Публикация
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
