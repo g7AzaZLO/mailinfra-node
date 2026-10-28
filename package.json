@@ -1,6 +1,6 @@
 {
   "name": "mailinfra",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Официальный SDK MailInfra для Node.js и TypeScript — email API для разработчиков",
   "license": "MIT",
   "author": "MailInfra",

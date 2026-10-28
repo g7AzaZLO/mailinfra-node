@@ -26,7 +26,7 @@ export const BASE_URL_ENV_VAR = "MAILINFRA_BASE_URL";
 const REQUEST_ID_HEADER = "X-Request-ID";
 
 /** Версия пакета; уезжает в `User-Agent`. Синхронна с package.json. */
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 /** Окружение API-ключа. */
 export type Environment = "live" | "test";
@@ -82,8 +82,8 @@ export interface RequestOptions {
   query?: Record<string, string | number | undefined>;
   headers?: Record<string, string>;
   /**
-   * Можно ли безопасно повторить запрос. Для `POST /emails` — да, SDK
-   * переиспользует `Idempotency-Key`; для батча — нет.
+   * Можно ли безопасно повторить запрос. Для `POST /emails` и батча — да,
+   * если SDK поставил `Idempotency-Key` и переиспользует его; без ключа — нет.
    */
   idempotent?: boolean;
   /** Сигнал отмены вызывающего; складывается с таймаутом SDK. */
@@ -129,6 +129,11 @@ function combineSignals(
 /** Ответ API вместе с метаданными, которые нужны ресурсам. */
 export interface ApiResponse<T> {
   data: T;
+  /**
+   * Тело ответа целиком. У страницы списка рядом с `data` лежат `has_more`
+   * и `next_cursor`, и без конверта ресурсу их не достать.
+   */
+  envelope: Record<string, unknown>;
   status: number;
   headers: Headers;
   requestId?: string;
@@ -248,7 +253,10 @@ function resolveRetryPolicy(options: MailInfraOptions): RetryPolicy {
  * ```
  */
 export class MailInfra {
-  /** Письма: `send`, `sendBatch`, `get`, `list`, `events`. */
+  /**
+   * Письма: `send`, `sendBatch`, `get`, `list`, `listAll`, `events`, `cancel`,
+   * `reschedule`.
+   */
   readonly emails: EmailsResource;
   /** Окружение ключа, распознанное по префиксу. */
   readonly environment: Environment;
@@ -316,7 +324,7 @@ export class MailInfra {
   /**
    * Выполняет запрос к API с повторами и разбором ошибок.
    *
-   * @returns Содержимое поля `data` вместе со статусом и заголовками ответа.
+   * @returns Содержимое поля `data` вместе с конвертом, статусом и заголовками ответа.
    * @throws {MailInfraError} Любая ошибка API или транспорта.
    */
   async request<T>(options: RequestOptions): Promise<ApiResponse<T>> {
@@ -358,7 +366,7 @@ export class MailInfra {
         const timedOut = cause instanceof Error && cause.name === "TimeoutError";
         // Отсутствие ответа не значит, что сервер ничего не принял: таймаут и
         // обрыв случаются и после того, как запрос дошёл и был выполнен.
-        // Поэтому неидемпотентный запрос (батч, отправка без
+        // Поэтому неидемпотентный запрос (отправка или батч без
         // `Idempotency-Key`) здесь не повторяется.
         const delay =
           !idempotent || attempt >= this.retryPolicy.maxRetries
@@ -374,12 +382,7 @@ export class MailInfra {
       const requestId = response.headers.get(REQUEST_ID_HEADER) ?? undefined;
 
       if (response.ok) {
-        return {
-          data: this.unwrap<T>(body, response.status, requestId),
-          status: response.status,
-          headers: response.headers,
-          ...(requestId === undefined ? {} : { requestId }),
-        };
+        return this.toApiResponse<T>(response, body, requestId);
       }
 
       const retryAfterMs = parseRetryAfter(response.headers.get("Retry-After"));
@@ -400,6 +403,26 @@ export class MailInfra {
 
       await sleep(delay, options.signal);
     }
+  }
+
+  /**
+   * Собирает успешный ответ: `data`, конверт целиком, статус и заголовки.
+   *
+   * @throws {MailInfraError} Тело не по контракту — без поля `data`.
+   */
+  private toApiResponse<T>(
+    response: Response,
+    body: unknown,
+    requestId: string | undefined,
+  ): ApiResponse<T> {
+    return {
+      data: this.unwrap<T>(body, response.status, requestId),
+      // Что это объект с `data`, уже проверил `unwrap` строкой выше.
+      envelope: body as Record<string, unknown>,
+      status: response.status,
+      headers: response.headers,
+      ...(requestId === undefined ? {} : { requestId }),
+    };
   }
 
   private buildUrl(path: string, query?: Record<string, string | number | undefined>): string {

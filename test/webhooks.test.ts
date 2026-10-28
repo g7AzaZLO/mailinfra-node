@@ -39,6 +39,20 @@ describe("вектора бэкенда", () => {
     expect(vectors.algorithm.header).toBe(SIGNATURE_HEADER);
   });
 
+  it("файл содержит кейсы окна ротации", () => {
+    // Без них проверка «любой v1» держалась бы только на тестах ниже: при
+    // перегенерации векторов кейсы ротации не должны пропасть молча.
+    const names = vectors.cases.map((item) => item.name);
+
+    expect(names).toEqual(
+      expect.arrayContaining([
+        "rotation_new_secret",
+        "rotation_previous_secret",
+        "rotation_unknown_secret",
+      ]),
+    );
+  });
+
   it.each(valid.map((item) => [item.name, item] as const))("принимает %s", async (_name, item) => {
     await expect(
       verify({
@@ -103,6 +117,75 @@ describe("разбор события", () => {
     });
 
     expect(event.id).toBeDefined();
+  });
+});
+
+describe("окно ротации secret", () => {
+  // Во время ротации MailInfra подписывает тело и новым secret, и прежним:
+  // `t=…,v1=<новым>,v1=<прежним>`. Раньше разбор оставлял только последнюю
+  // подпись, и обработчик, уже переключённый на новый secret, отвергал все
+  // доставки окна ротации.
+  const body = '{"id":"evt_x","type":"email.scheduled","created_at":"2026-10-28T12:00:00Z","data":{}}';
+  const current = "whsec_new";
+  const previous = "whsec_old";
+
+  async function rotationHeader(): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    const signatures = await Promise.all(
+      [current, previous].map((secret) => sign({ body, secret, timestamp: now })),
+    );
+    return `t=${now},${signatures.map((signature) => `v1=${signature}`).join(",")}`;
+  }
+
+  it.each([
+    ["новым secret — первая подпись", current],
+    ["прежним secret — последняя подпись", previous],
+  ])("принимает подпись %s", async (_name, secret) => {
+    const signatureHeader = await rotationHeader();
+
+    await expect(verify({ body, secret, signatureHeader })).resolves.toBe(true);
+    await expect(constructEvent({ body, secret, signatureHeader })).resolves.toMatchObject({
+      type: "email.scheduled",
+    });
+  });
+
+  it("отклоняет secret, которым не подписана ни одна из подписей", async () => {
+    const signatureHeader = await rotationHeader();
+
+    await expect(verify({ body, secret: "whsec_other", signatureHeader })).resolves.toBe(false);
+    await expect(
+      constructEvent({ body, secret: "whsec_other", signatureHeader }),
+    ).rejects.toMatchObject({ reason: "signature_mismatch" });
+  });
+});
+
+describe("metadata в событии", () => {
+  it("доезжает до data.email.metadata", async () => {
+    const body = JSON.stringify({
+      id: "evt_1",
+      type: "email.canceled",
+      created_at: "2026-10-28T12:00:00Z",
+      data: {
+        email: {
+          id: "018e1b7a-1111-7000-aaaa-111111111111",
+          from: "hello@mail.example.ru",
+          to: ["user@example.com"],
+          subject: "Напоминание",
+          tags: [],
+          metadata: { order_id: "4242" },
+          status: "CANCELED",
+        },
+        event: {},
+      },
+    });
+    const secret = "whsec_test";
+    const now = Math.floor(Date.now() / 1000);
+    const signatureHeader = `t=${now},v1=${await sign({ body, secret, timestamp: now })}`;
+
+    const event = await constructEvent({ body, secret, signatureHeader });
+
+    expect(event.type).toBe("email.canceled");
+    expect(event.data.email?.metadata?.["order_id"]).toBe("4242");
   });
 });
 

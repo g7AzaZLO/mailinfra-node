@@ -88,6 +88,8 @@ const MINIMAL = {
   text: "Текст",
 };
 
+const BATCH_BODY = { data: { results: [], accepted_count: 0, failed_count: 0 } };
+
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -125,21 +127,35 @@ describe("повторы", () => {
     expect(calls).toHaveLength(1);
   });
 
-  it("не повторяет батч после 5xx", async () => {
+  it("повторяет батч после 5xx с тем же ключом идемпотентности", async () => {
+    // С ключом бэкенд не дублирует уже принятые письма батча, поэтому повтор
+    // безопасен — ровно как у send().
+    const { fetch, calls } = fakeFetch([json(500, {}), json(503, {}), json(202, BATCH_BODY)]);
+
+    const result = await client(fetch).emails.sendBatch([MINIMAL, MINIMAL]);
+
+    const keys = calls.map((call) => (call.init.headers as Record<string, string>)["Idempotency-Key"]);
+    expect(calls).toHaveLength(3);
+    expect(new Set(keys).size).toBe(1);
+    expect(keys[0]).toBe(result.idempotencyKey);
+  });
+
+  it("не повторяет батч без ключа после 5xx", async () => {
     const { fetch, calls } = fakeFetch([json(500, {})]);
 
-    await expect(client(fetch).emails.sendBatch([MINIMAL])).rejects.toBeInstanceOf(ServerError);
+    await expect(
+      client(fetch).emails.sendBatch([MINIMAL], { idempotencyKey: null }),
+    ).rejects.toBeInstanceOf(ServerError);
     expect(calls).toHaveLength(1);
   });
 
-  it("повторяет батч после 429 — письма не были приняты", async () => {
-    const batch = { data: { results: [], accepted_count: 0, failed_count: 0 } };
+  it("повторяет батч без ключа после 429 — письма не были приняты", async () => {
     const { fetch, calls } = fakeFetch([
       json(429, {}, { "Retry-After": "0" }),
-      json(202, batch),
+      json(202, BATCH_BODY),
     ]);
 
-    await client(fetch).emails.sendBatch([MINIMAL]);
+    await client(fetch).emails.sendBatch([MINIMAL], { idempotencyKey: null });
 
     expect(calls).toHaveLength(2);
   });
@@ -262,31 +278,53 @@ describe("повторы без гарантии идемпотентности"
     return error;
   }
 
-  it("не повторяет батч после таймаута — часть писем могла уже уехать", async () => {
+  const WITHOUT_KEY = { idempotencyKey: null };
+
+  it("не повторяет батч без ключа после таймаута — часть писем могла уже уехать", async () => {
     const { fetch, calls } = failingFetch(timeoutError());
 
-    await expect(client(fetch).emails.sendBatch([MINIMAL])).rejects.toBeInstanceOf(
+    await expect(client(fetch).emails.sendBatch([MINIMAL], WITHOUT_KEY)).rejects.toBeInstanceOf(
       APITimeoutError,
     );
     expect(calls).toHaveLength(1);
   });
 
-  it("не повторяет батч после обрыва соединения", async () => {
+  it("не повторяет батч без ключа после обрыва соединения", async () => {
     const { fetch, calls } = failingFetch(new TypeError("fetch failed"));
 
-    await expect(client(fetch).emails.sendBatch([MINIMAL])).rejects.toBeInstanceOf(
+    await expect(client(fetch).emails.sendBatch([MINIMAL], WITHOUT_KEY)).rejects.toBeInstanceOf(
       APIConnectionError,
     );
     expect(calls).toHaveLength(1);
   });
 
-  it("не повторяет батч после обрыва при чтении тела — 202 уже был", async () => {
+  it("не повторяет батч без ключа после обрыва при чтении тела — 202 уже был", async () => {
     const { fetch, calls } = fakeFetch(() => brokenBody(202));
 
-    await expect(client(fetch).emails.sendBatch([MINIMAL])).rejects.toBeInstanceOf(
+    await expect(client(fetch).emails.sendBatch([MINIMAL], WITHOUT_KEY)).rejects.toBeInstanceOf(
       APIConnectionError,
     );
     expect(calls).toHaveLength(1);
+  });
+
+  it("не повторяет батч при autoIdempotency: false", async () => {
+    const { fetch, calls } = failingFetch(timeoutError());
+
+    await expect(
+      client(fetch, { autoIdempotency: false }).emails.sendBatch([MINIMAL]),
+    ).rejects.toBeInstanceOf(APITimeoutError);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("батч с ключом повторяет обрыв при чтении тела тем же ключом", async () => {
+    const { fetch, calls } = fakeFetch([brokenBody(202), json(200, BATCH_BODY)]);
+
+    const result = await client(fetch).emails.sendBatch([MINIMAL]);
+
+    const keys = calls.map((call) => (call.init.headers as Record<string, string>)["Idempotency-Key"]);
+    expect(calls).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+    expect(result.replayed).toBe(true);
   });
 
   it("не повторяет 5xx у отправки без ключа идемпотентности", async () => {

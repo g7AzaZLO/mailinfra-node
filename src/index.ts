@@ -17,13 +17,15 @@
  *
  * Что клиент делает за вас:
  *
- * - ставит `Idempotency-Key` на каждую отправку и переиспользует его при
- *   повторах — сбой сети не превращается в два письма;
+ * - ставит `Idempotency-Key` на каждую отправку и каждый батч и
+ *   переиспользует его при повторах — сбой сети не превращается в два письма;
  * - повторяет `429`/`5xx`/таймауты с экспоненциальным backoff и уважает
  *   `Retry-After`;
  * - поднимает ошибки API типизированными классами (`RateLimitError`,
  *   `DomainNotVerifiedError`, …);
- * - проверяет подписи вебхуков (`verify`, `constructEvent`).
+ * - обходит постраничный список писем за вас (`listAll`);
+ * - проверяет подписи вебхуков (`verify`, `constructEvent`), в том числе в
+ *   окне ротации secret.
  *
  * Покрытие v1 — публичный API писем (`/v1/emails*`). Управление доменами,
  * шаблонами, вебхуками и ключами — Management API на сессионном токене, оно
@@ -42,8 +44,10 @@ export {
   ConflictError,
   DomainNotAttachedError,
   DomainNotVerifiedError,
+  EmailNotScheduledError,
   errorFromResponse,
   IdempotencyInFlightError,
+  IPNotAllowedError,
   LegalDocumentsNotAcceptedError,
   MailInfraError,
   NotFoundError,
@@ -52,6 +56,8 @@ export {
   ReservedEmailHeaderError,
   SandboxRecipientNotAllowedError,
   SandboxTrialExhaustedError,
+  SendAtInvalidError,
+  SendAtTooFarError,
   ServerError,
   TemplateRenderError,
   TemplateVariableMissingError,
@@ -62,18 +68,26 @@ export type { ErrorDetails, ValidationField } from "./errors.js";
 export { buildSendPayload, EmailsResource } from "./resources/emails.js";
 
 export {
+  BATCH_IDEMPOTENCY_KEY_MAX_LENGTH,
   IDEMPOTENCY_KEY_MAX_LENGTH,
   MAX_ATTACHMENT_BASE64_LENGTH,
   MAX_ATTACHMENTS,
   MAX_BATCH_SIZE,
+  MAX_CONTENT_ID_LENGTH,
   MAX_CONTENT_TYPE_LENGTH,
   MAX_FILENAME_LENGTH,
   MAX_FROM_NAME_LENGTH,
+  MAX_METADATA_BYTES,
+  MAX_METADATA_KEY_LENGTH,
+  MAX_METADATA_KEYS,
+  MAX_METADATA_VALUE_LENGTH,
   MAX_RECIPIENTS,
   MAX_REPLY_TO,
   MAX_SUBJECT_LENGTH,
   MAX_TAGS,
   MAX_TEMPLATE_LENGTH,
+  MAX_TTL_SECONDS,
+  MIN_TTL_SECONDS,
 } from "./limits.js";
 
 export {
@@ -101,12 +115,19 @@ export type {
   EmailEvent,
   EmailEventType,
   EmailListItem,
+  EmailListPage,
+  EmailMetadata,
+  EmailRescheduleRequest,
+  EmailScheduleData,
   EmailSendRequest,
   EmailSendResponseData,
   EmailSource,
   EmailStatus,
   ErrorResponse,
+  IdempotencyResult,
   ListEmailsParams,
+  RescheduleEmailParams,
+  SendBatchResult,
   SendEmailParams,
   SendEmailResult,
   SendOptions,

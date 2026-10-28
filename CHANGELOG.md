@@ -6,6 +6,57 @@
 До `1.0.0` минорные версии могут содержать несовместимые изменения: пока не покрыт
 Management API, публичная поверхность SDK ещё расширяется.
 
+## [0.2.0] — 2026-10-28
+
+### Добавлено
+
+- `metadata` у письма в `send` и в каждом письме `sendBatch`: пары «ключ — строка»
+  возвращаются в `metadata` у `get`/`list` и в `data.email.metadata` вебхуков. Лимиты
+  проверяются до запроса: до 20 ключей, ключ — 1–40 символов `[A-Za-z0-9_.-]`, значение —
+  строка до 500 символов без NUL, весь объект — до 4096 байт JSON в UTF-8 (размер
+  считается так же, как на бэкенде).
+- Отложенная отправка: `send_at` в `send` и `sendBatch` — `Date` (уходит через
+  `toISOString()`) или строка ISO 8601 с часовым поясом; строка без пояса отбивается до
+  запроса. Методы `cancel(emailId)` (`POST /v1/emails/{id}/cancel`) и
+  `reschedule(emailId, { send_at })` (`PATCH /v1/emails/{id}`) возвращают
+  `EmailScheduleData`.
+- `ttl` — срок жизни письма в секундах (60..86 400), проверяется до запроса.
+- `content_id` у вложения — inline-картинка, на которую HTML ссылается как
+  `cid:<content_id>`; длина проверяется до запроса.
+- `Idempotency-Key` у `sendBatch`: SDK ставит ключ сам, переиспользует его при повторах и
+  повторяет батч с ключом после `5xx`, таймаута и обрыва соединения так же, как
+  `send()`. Свой ключ — `sendBatch(emails, { idempotencyKey })`, до 252 символов;
+  `null` отключает его. Результат — `SendBatchResult` с `replayed`, `idempotencyKey` и
+  `requestId`.
+- Курсорная пагинация: `list({ cursor })` и `listAll()` — асинхронный итератор, который
+  сам идёт по `next_cursor` и запрашивает страницы по мере обхода. Ответ с
+  `has_more: true` без курсора — ошибка `malformed_response`, а не молча оборванный обход.
+- Статусы `SCHEDULED` и `CANCELED`, события `scheduled` и `canceled` (вебхуки
+  `email.scheduled` и `email.canceled`), категория недоставки `delivery-expired`, поля
+  `metadata`, `scheduled_at` и `expires_at` у письма — из перегенерированных типов спеки.
+- Классы ошибок `EmailNotScheduledError` (`409`), `SendAtTooFarError` и
+  `SendAtInvalidError` (`400`), `IPNotAllowedError` (`403` — ключ использован с IP-адреса
+  вне его белого списка).
+- Константы лимитов `MAX_METADATA_KEYS`, `MAX_METADATA_KEY_LENGTH`,
+  `MAX_METADATA_VALUE_LENGTH`, `MAX_METADATA_BYTES`, `MIN_TTL_SECONDS`, `MAX_TTL_SECONDS`,
+  `MAX_CONTENT_ID_LENGTH`, `BATCH_IDEMPOTENCY_KEY_MAX_LENGTH`.
+- `spec-parity.test.ts` сверяет запрос каждого метода SDK — метод, путь, query,
+  заголовки и тело — с операцией спеки и требует, чтобы каждая операция спеки была
+  покрыта методом SDK.
+
+### Изменено
+
+- **Несовместимо:** `list()` возвращает страницу `EmailListPage` —
+  `{ data, has_more, next_cursor }` — вместо массива писем. Письма теперь в `page.data`.
+- **Несовместимо:** `sendBatch()` по умолчанию ставит `Idempotency-Key` и повторяет батч
+  после `5xx` и сетевых сбоев. Прежнее поведение — `{ idempotencyKey: null }`.
+- Проверка подписи вебхуков принимает запрос, если совпала любая из подписей `v1`: в окне
+  ротации secret их две — новым и прежним. Раньше сверялась только последняя, и
+  обработчик с новым secret отвергал доставки до конца окна.
+- Пустой идентификатор письма в `get`, `events`, `cancel` и `reschedule` отбивается до
+  запроса: иначе вызов уходил на `/v1/emails/` — другой эндпоинт.
+- `ApiResponse` несёт `envelope` — тело ответа целиком, рядом с `data`.
+
 ## [0.1.0] — 2026-10-27
 
 Первый релиз.

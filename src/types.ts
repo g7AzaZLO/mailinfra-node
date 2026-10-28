@@ -9,7 +9,9 @@
  *
  * Имена полей письма совпадают с API один в один (`from`, `reply_to`,
  * `content_base64`) — чтобы примеры из документации MailInfra работали в
- * SDK без переименований.
+ * SDK без переименований. Это касается и ответов: страница списка — это
+ * `has_more` и `next_cursor`, как в API. В camelCase только то, чего в API
+ * нет и что добавляет сам SDK: `replayed`, `idempotencyKey`, `requestId`.
  */
 
 import type { components } from "./generated/openapi.js";
@@ -30,6 +32,15 @@ export type EmailListItem = Schemas["EmailListItem"];
 
 /** Письмо с телом, заголовками и диагностикой доставки. */
 export type EmailDetail = Schemas["EmailDetail"];
+
+/** Пары «ключ — значение» письма: уходят в `send()` и возвращаются в письме и вебхуках. */
+export type EmailMetadata = NonNullable<EmailSendRequest["metadata"]>;
+
+/** Тело переноса запланированного письма, как его описывает спека. */
+export type EmailRescheduleRequest = Schemas["EmailRescheduleRequest"];
+
+/** Состояние планирования письма — ответ `cancel()` и `reschedule()`. */
+export type EmailScheduleData = Schemas["EmailScheduleData"];
 
 /** Событие жизненного цикла письма. */
 export type EmailEvent = Schemas["EmailEventPublic"];
@@ -72,6 +83,9 @@ export type ErrorResponse = Schemas["ErrorResponse"];
  * в спеке у него есть значение по умолчанию, поэтому openapi-typescript
  * помечает поле обязательным, а подставить `application/octet-stream` умеет
  * и сам SDK.
+ *
+ * С `content_id` вложение становится inline-картинкой: оно встраивается в
+ * письмо, и HTML ссылается на него как `<img src="cid:<content_id>">`.
  */
 export type AttachmentInput = Omit<EmailAttachmentInput, "content_base64" | "content_type"> & {
   /** MIME-тип; по умолчанию `application/octet-stream`. */
@@ -93,11 +107,11 @@ export type AttachmentInput = Omit<EmailAttachmentInput, "content_base64" | "con
  * Параметры отправки письма.
  *
  * Отличия от `EmailSendRequest` из спеки — только послабления для удобства:
- * адресата можно передать строкой, а вложение — байтами.
+ * адресата можно передать строкой, вложение — байтами, а `send_at` — `Date`.
  */
 export type SendEmailParams = Omit<
   EmailSendRequest,
-  "to" | "cc" | "bcc" | "reply_to" | "attachments"
+  "to" | "cc" | "bcc" | "reply_to" | "attachments" | "send_at"
 > & {
   /** Получатель или получатели (до 50 вместе с cc и bcc). */
   to: string | string[];
@@ -109,6 +123,14 @@ export type SendEmailParams = Omit<
   reply_to?: string | string[];
   /** Вложения (до 10, суммарно до 25 МиБ вместе с письмом). */
   attachments?: AttachmentInput[];
+  /**
+   * Отложенная отправка: `Date` или строка ISO 8601 **с часовым поясом**
+   * (`2026-11-01T09:00:00+03:00`), не дальше 7 дней от приёма письма.
+   * `Date` уходит через `toISOString()`. Письмо получит статус `SCHEDULED`,
+   * его можно отменить (`cancel`) или перенести (`reschedule`). Время в
+   * прошлом — отправить сразу.
+   */
+  send_at?: string | Date | null;
 };
 
 /** Общие опции любого вызова. */
@@ -121,20 +143,22 @@ export interface CallOptions {
   signal?: AbortSignal;
 }
 
-/** Дополнительные опции вызова отправки. */
+/** Дополнительные опции вызова отправки — `send()` и `sendBatch()`. */
 export interface SendOptions extends CallOptions {
   /**
    * Свой ключ идемпотентности. По умолчанию SDK генерирует `crypto.randomUUID()`
-   * на каждый вызов; `null` отключает заголовок для этого вызова.
+   * на каждый вызов; `null` отключает заголовок для этого вызова. У батча
+   * ключ один на весь запрос и не длиннее 252 символов.
    */
   idempotencyKey?: string | null;
 }
 
-/** Результат отправки одного письма. */
-export interface SendEmailResult extends EmailSendResponseData {
+/** Сведения об идемпотентности, которые SDK добавляет к ответу отправки. */
+export interface IdempotencyResult {
   /**
    * `true`, если это идемпотентный повтор: письмо было принято предыдущим
-   * запросом с тем же ключом, повторной отправки не произошло.
+   * запросом с тем же ключом, повторной отправки не произошло. У батча —
+   * если повтором оказались все принятые письма.
    */
   replayed: boolean;
   /** Ключ идемпотентности, с которым ушёл запрос. */
@@ -142,6 +166,12 @@ export interface SendEmailResult extends EmailSendResponseData {
   /** Идентификатор запроса для обращений в поддержку. */
   requestId?: string;
 }
+
+/** Результат отправки одного письма. */
+export interface SendEmailResult extends EmailSendResponseData, IdempotencyResult {}
+
+/** Результат пакетной отправки вместе со сведениями об идемпотентности. */
+export interface SendBatchResult extends BatchSendResponseData, IdempotencyResult {}
 
 /** Фильтры выборки писем. */
 export interface ListEmailsParams {
@@ -153,6 +183,32 @@ export interface ListEmailsParams {
   from?: string | Date;
   /** Конец интервала. */
   to?: string | Date;
-  /** Размер выборки, 1..100 (по умолчанию 25 на стороне API). */
+  /** Размер страницы, 1..100 (по умолчанию 25 на стороне API). */
   limit?: number;
+  /** `next_cursor` предыдущей страницы; без него — первая страница. */
+  cursor?: string;
+}
+
+/**
+ * Страница писем: новые сначала.
+ *
+ * Поля называются как в API. `next_cursor` здесь всегда есть — `null`, если
+ * страница последняя, — тогда как в ответе API его может не быть вовсе.
+ */
+export interface EmailListPage {
+  /** Письма страницы. */
+  data: EmailListItem[];
+  /** Есть ли письма после этой страницы. */
+  has_more: boolean;
+  /** Курсор следующей страницы для `cursor`; `null` у последней. */
+  next_cursor: string | null;
+}
+
+/** Параметры переноса запланированного письма. */
+export interface RescheduleEmailParams {
+  /**
+   * Новое время отправки: `Date` или строка ISO 8601 с часовым поясом, не
+   * дальше 7 дней от приёма письма. Время в прошлом — отправить сейчас.
+   */
+  send_at: string | Date;
 }

@@ -12,6 +12,15 @@
  * `app.services.webhook_service.sign_payload`; вектора общие для бэкенда и
  * всех SDK — `webhook-signatures.json` (в репозитории SDK — `resources/`).
  *
+ * Во время ротации secret подписей две — новым secret и прежним, последней:
+ *
+ * ```
+ * X-MailInfra-Signature: t=1715461200,v1=<новым>,v1=<прежним>
+ * ```
+ *
+ * Подпись верна, если с вашим secret совпала любая из них: обработчик со
+ * старым secret продолжает работать, пока вы не обновите конфиг.
+ *
  * Реализация на WebCrypto, без node-only API: работает в Node >= 20 (глобальный
  * `crypto` без флага появился в 19), Cloudflare Workers, Deno и Bun.
  *
@@ -77,9 +86,11 @@ export interface WebhookEvent {
    */
   id: string;
   /**
-   * Тип: `email.<событие>` у событий письма (например `email.bounced`),
-   * `deliverability.<инцидент>` как есть (например `deliverability.dns_degraded`),
-   * `test.ping` у тестовой отправки из дашборда.
+   * Тип: `email.<событие>` у событий письма (например `email.bounced`,
+   * `email.scheduled` при отложенной отправке, `email.canceled` при её
+   * отмене), `deliverability.<инцидент>` как есть (например
+   * `deliverability.dns_degraded`), `test.ping` у тестовой отправки из
+   * дашборда.
    */
   type: string;
   /** Момент события на стороне MailInfra, ISO-8601. */
@@ -96,6 +107,11 @@ export interface WebhookEvent {
       to: string[];
       subject: string;
       tags: string[];
+      /**
+       * `metadata`, переданный при отправке; пустой объект, если его не было.
+       * Необязателен в типе: доставки, собранные до появления поля, его не несут.
+       */
+      metadata?: Record<string, string>;
       status: string;
     };
     event?: Record<string, unknown>;
@@ -154,6 +170,20 @@ function timingSafeEqualHex(a: string, b: string): boolean {
 }
 
 /**
+ * Совпала ли ожидаемая подпись хотя бы с одной из присланных.
+ *
+ * Сравниваются все, без выхода на первом совпадении: иначе по времени ответа
+ * было бы видно, какая из подписей ротации подошла.
+ */
+function matchesAny(expected: string, candidates: readonly string[]): boolean {
+  let matched = false;
+  for (const candidate of candidates) {
+    matched = timingSafeEqualHex(expected, candidate) || matched;
+  }
+  return matched;
+}
+
+/**
  * Отвергает пустой secret.
  *
  * WebCrypto отвергает ключ нулевой длины DOMException'ом. Типовой источник —
@@ -205,20 +235,33 @@ export async function sign(input: {
   return toHex(await crypto.subtle.sign("HMAC", key, signingString));
 }
 
-function parseHeader(signatureHeader: string): { timestamp: number; signature: string } {
-  const parts = new Map<string, string>();
+/**
+ * Разбирает `t=<unix>,v1=<hex>[,v1=<hex>…]`.
+ *
+ * Подписи `v1` собираются все: раньше каждая следующая затирала предыдущую,
+ * и в окне ротации проходила только последняя — подпись прежним secret, —
+ * а обработчик с новым secret отвергал каждую доставку.
+ */
+function parseHeader(signatureHeader: string): { timestamp: number; signatures: string[] } {
+  let rawTimestamp: string | undefined;
+  const signatures: string[] = [];
   for (const chunk of signatureHeader.split(",")) {
     const index = chunk.indexOf("=");
-    if (index > 0) {
-      parts.set(chunk.slice(0, index).trim(), chunk.slice(index + 1).trim());
+    if (index <= 0) {
+      continue;
+    }
+    const key = chunk.slice(0, index).trim();
+    const value = chunk.slice(index + 1).trim();
+    if (key === "t") {
+      rawTimestamp = value;
+    } else if (key === "v1") {
+      signatures.push(value);
     }
   }
 
-  const rawTimestamp = parts.get("t");
-  const signature = parts.get("v1");
-  if (rawTimestamp === undefined || signature === undefined) {
+  if (rawTimestamp === undefined || signatures.length === 0) {
     throw new WebhookSignatureError(
-      `Заголовок ${SIGNATURE_HEADER} не разобран: ожидается 't=<unix>,v1=<hex>'`,
+      `Заголовок ${SIGNATURE_HEADER} не разобран: ожидается 't=<unix>,v1=<hex>[,v1=<hex>]'`,
       "malformed_header",
     );
   }
@@ -241,32 +284,44 @@ function parseHeader(signatureHeader: string): { timestamp: number; signature: s
     );
   }
 
-  return { timestamp, signature };
+  return { timestamp, signatures };
+}
+
+/**
+ * Проверяет secret, заголовок, возраст и подпись — в этом порядке.
+ *
+ * Общая часть `verify` и `constructEvent`: порядок проверок у них обязан
+ * совпадать, иначе один и тот же запрос отвергался бы по разным причинам.
+ *
+ * @throws {WebhookSignatureError} Первая же не прошедшая проверка.
+ */
+async function checkSignature(input: VerifyInput): Promise<void> {
+  requireSecret(input.secret);
+  const { timestamp, signatures } = parseHeader(input.signatureHeader);
+
+  const maxAge = input.maxAgeSeconds ?? DEFAULT_MAX_AGE_SECONDS;
+  if (maxAge && Math.abs(Math.floor(Date.now() / 1000) - timestamp) > maxAge) {
+    throw new WebhookSignatureError(`Подпись старше ${maxAge} с — возможен replay`, "too_old");
+  }
+
+  const expected = await sign({ body: input.body, secret: input.secret, timestamp });
+  if (!matchesAny(expected, signatures)) {
+    throw new WebhookSignatureError("Подпись не совпала", "signature_mismatch");
+  }
 }
 
 /**
  * Проверяет подпись, не бросая исключений.
  *
  * Любая причина отказа — нечитаемый заголовок, пустой или битый secret,
- * устаревшая подпись — это `false`. Нужна причина отказа — берите
+ * устаревшая подпись — это `false`. В окне ротации secret достаточно, чтобы
+ * совпала любая из подписей `v1`. Нужна причина отказа — берите
  * `constructEvent`, он кидает `WebhookSignatureError` с полем `reason`.
  */
 export async function verify(input: VerifyInput): Promise<boolean> {
   try {
-    requireSecret(input.secret);
-    const parsed = parseHeader(input.signatureHeader);
-
-    const maxAge = input.maxAgeSeconds ?? DEFAULT_MAX_AGE_SECONDS;
-    if (maxAge && Math.abs(Math.floor(Date.now() / 1000) - parsed.timestamp) > maxAge) {
-      return false;
-    }
-
-    const expected = await sign({
-      body: input.body,
-      secret: input.secret,
-      timestamp: parsed.timestamp,
-    });
-    return timingSafeEqualHex(expected, parsed.signature);
+    await checkSignature(input);
+    return true;
   } catch {
     // Сюда попадают и ошибки WebCrypto (например, `importKey` на пустом
     // секрете): контракт функции — не бросать, а отвечать false.
@@ -278,25 +333,15 @@ export async function verify(input: VerifyInput): Promise<boolean> {
  * Проверяет подпись и возвращает типизированное событие.
  *
  * Это рекомендуемый способ: тело нельзя разбирать раньше, чем проверена
- * подпись, иначе обработчик доверяет неаутентифицированным данным.
+ * подпись, иначе обработчик доверяет неаутентифицированным данным. Как и
+ * `verify`, принимает заголовок с двумя подписями `v1` из окна ротации.
  *
  * @throws {WebhookSignatureError} Подпись не сошлась, устарела, secret пуст,
  * тело не является JSON-объектом или событие пришло не по контракту
  * (`reason` говорит, что именно).
  */
 export async function constructEvent(input: VerifyInput): Promise<WebhookEvent> {
-  requireSecret(input.secret);
-  const { timestamp, signature } = parseHeader(input.signatureHeader);
-
-  const maxAge = input.maxAgeSeconds ?? DEFAULT_MAX_AGE_SECONDS;
-  if (maxAge && Math.abs(Math.floor(Date.now() / 1000) - timestamp) > maxAge) {
-    throw new WebhookSignatureError(`Подпись старше ${maxAge} с — возможен replay`, "too_old");
-  }
-
-  const expected = await sign({ body: input.body, secret: input.secret, timestamp });
-  if (!timingSafeEqualHex(expected, signature)) {
-    throw new WebhookSignatureError("Подпись не совпала", "signature_mismatch");
-  }
+  await checkSignature(input);
 
   const text = typeof input.body === "string" ? input.body : new TextDecoder().decode(toBytes(input.body));
 

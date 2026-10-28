@@ -28,14 +28,15 @@ console.log(result.id, result.status);
 
 | Возможность | Подробности |
 |---|---|
-| Идемпотентность | На каждую отправку ставится `Idempotency-Key`, и он **переиспользуется при повторах** — обрыв сети не превращается в два письма |
+| Идемпотентность | На каждую отправку и каждый батч ставится `Idempotency-Key`, и он **переиспользуется при повторах** — обрыв сети не превращается в два письма |
 | Повторы | `429`, `408/425`, `5xx` и сетевые сбои повторяются с экспоненциальным backoff и half-jitter |
 | Rate limit | `Retry-After` уважается как есть; слишком долгий (>60 с) не блокирует поток, а приходит как `RateLimitError.retryAfter` |
 | Типизированные ошибки | `DomainNotVerifiedError`, `RateLimitError`, `UnprocessableError.fields` и ещё ~20 классов |
-| Локальная валидация | Лимиты спеки (получатели, теги, вложения, длина темы) проверяются до запроса — письмо на 25 МиБ не уедет в сеть ради `422` |
+| Локальная валидация | Лимиты спеки (получатели, теги, вложения, длина темы, `metadata`, `ttl`, часовой пояс в `send_at`) проверяются до запроса — письмо на 25 МиБ не уедет в сеть ради `422` |
+| Пагинация | `listAll()` сам идёт по курсору `next_cursor`, страница за страницей, по мере обхода |
 | Отмена | `signal: AbortSignal` у любого вызова; прерывает и паузу между повторами |
 | Типы | Выведены из OpenAPI-спеки MailInfra (`openapi-typescript`), а не написаны руками |
-| Вебхуки | `constructEvent()` — проверка HMAC-подписи на WebCrypto и разбор события |
+| Вебхуки | `constructEvent()` — проверка HMAC-подписи на WebCrypto и разбор события, в том числе в окне ротации secret |
 
 ## Аутентификация
 
@@ -68,6 +69,70 @@ await client.emails.send({
 });
 ```
 
+### Metadata
+
+Свои пары «ключ — значение» — номер заказа, id пользователя — чтобы связать письмо и
+события по нему со своей системой. Они возвращаются в `get()`, `list()` и в
+`data.email.metadata` каждого вебхука письма, на доставку не влияют:
+
+```ts
+await client.emails.send({
+  from: "billing@mail.example.ru",
+  to: "user@example.com",
+  template: "order_paid",
+  variables: { order_id: 4242 },
+  metadata: { order_id: "4242", user_id: "u-17" },
+});
+```
+
+Лимиты проверяются до запроса: до 20 ключей; ключ — от 1 до 40 символов из латиницы,
+цифр, `_`, `-` и `.`; значение — строка до 500 символов без NUL; весь объект в JSON —
+до 4096 байт UTF-8. Нарушение — `MailInfraError` с кодом `invalid_request`.
+
+### Отложенная отправка
+
+`send_at` — `Date` или строка ISO 8601 **с часовым поясом**, не дальше 7 дней от приёма
+письма. `Date` уходит через `toISOString()`; строку без пояса (`2026-11-01T09:00:00`) SDK
+не отправит — API её всё равно отклонит. Время в прошлом — отправить сразу.
+
+```ts
+const reminder = await client.emails.send({
+  from: "no-reply@mail.example.ru",
+  to: "user@example.com",
+  template: "webinar_reminder",
+  send_at: "2026-11-01T09:00:00+03:00",
+});
+console.log(reminder.status); // "SCHEDULED"
+
+// Перенести — новое время, тот же горизонт в 7 дней от приёма письма:
+await client.emails.reschedule(reminder.id, { send_at: new Date("2026-11-01T08:00:00Z") });
+
+// Отменить — письмо получит статус CANCELED, резерв квоты вернётся:
+await client.emails.cancel(reminder.id);
+```
+
+Оба метода возвращают `{ id, status, scheduled_at }`. Письмо, которое уже ушло в очередь,
+отправлено или отменено, — это `EmailNotScheduledError` (`409`, текущий статус — в
+`error.details.status`); `send_at` дальше горизонта — `SendAtTooFarError` (`400`). Отмена и
+перенос требуют права на отправку.
+
+### Срок жизни письма
+
+`ttl` — сколько секунд письмо актуально, от 60 до 86 400, отсчёт от `send_at` или от приёма.
+Не дошедшее за это время письмо не отправляется и не повторяется: статус `FAILED` с
+причиной `expired` или отказ с категорией `delivery-expired`. Для кодов входа и других
+писем, которые поздно уже не нужны:
+
+```ts
+await client.emails.send({
+  from: "auth@mail.example.ru",
+  to: "user@example.com",
+  subject: "Код входа: 4821",
+  text: "Код действует 5 минут.",
+  ttl: 300,
+});
+```
+
 ### С вложением
 
 Передайте байты — SDK сам закодирует их в base64:
@@ -85,6 +150,28 @@ await client.emails.send({
       filename: "invoice.pdf",
       content: await readFile("invoice.pdf"),
       content_type: "application/pdf",
+    },
+  ],
+});
+```
+
+### Inline-картинки
+
+Вложение с `content_id` встраивается в письмо, а не прикладывается файлом; HTML ссылается
+на него как `cid:<content_id>`:
+
+```ts
+await client.emails.send({
+  from: "hello@mail.example.ru",
+  to: "user@example.com",
+  subject: "Новая коллекция",
+  html: '<img src="cid:logo@mail.example.ru" alt="Логотип"><p>Привет!</p>',
+  attachments: [
+    {
+      filename: "logo.png",
+      content: await readFile("logo.png"),
+      content_type: "image/png",
+      content_id: "logo@mail.example.ru",
     },
   ],
 });
@@ -133,11 +220,25 @@ for (const item of batch.results) {
 ```
 
 > **Важно.** Батч возвращает `202`, даже если часть писем отклонена — проверяйте
-> `error` у каждого элемента. `Idempotency-Key` этот эндпоинт не принимает, поэтому
-> SDK **не** повторяет его после `5xx`: повтор мог бы отправить часть писем дважды.
-> Повторяется только `429` — единственный отказ, который случается до приёма
-> писем. Обрыв соединения и таймаут батча **не** повторяются: сервер мог уже
-> закоммитить часть писем, поэтому решение о повторе за вами.
+> `error` у каждого элемента.
+
+`Idempotency-Key` ставится на весь батч так же, как у `send()`: один ключ на вызов,
+переиспользуемый при повторах. Бэкенд выводит из него ключ каждого письма, поэтому повтор
+не дублирует уже принятые письма, а отклонённые пробует принять заново — и SDK
+повторяет батч после `5xx`, таймаута и обрыва соединения. Если повтором оказались все
+принятые письма, `batch.replayed === true`:
+
+```ts
+const batch = await client.emails.sendBatch(emails, { idempotencyKey: "import_2026_10_28" });
+console.log(batch.idempotencyKey, batch.replayed);
+```
+
+Ключ батча — печатаемый ASCII до 252 символов: ещё три бэкенд дописывает под номер письма.
+Ключ внутри отдельного письма батча SDK отбивает (`invalid_batch_item`) — он задаётся
+только в опциях. Без ключа (`{ idempotencyKey: null }` или `autoIdempotency: false`) батч
+повторяется только на `429` — единственном отказе, который случается до приёма писем:
+после `5xx`, таймаута или обрыва сервер мог уже закоммитить часть писем, и решение о
+повторе за вами.
 
 ## Чтение
 
@@ -149,11 +250,33 @@ for (const event of await client.emails.events(result.id)) {
   console.log(event.timestamp, event.type, event.data);
 }
 
-const recent = await client.emails.list({ status: "BOUNCED", tag: "onboarding", limit: 50 });
+let cursor: string | undefined;
+do {
+  const page = await client.emails.list({ status: "BOUNCED", tag: "onboarding", limit: 50, cursor });
+  for (const item of page.data) {
+    console.log(item.id, item.metadata);
+  }
+  cursor = page.next_cursor ?? undefined;
+} while (cursor !== undefined);
 ```
 
-Фильтры `list()`: `status`, `from_email`, `to_email`, `tag`, `from`, `to` (строка ISO
-или `Date`), `limit` (1..100).
+`list()` возвращает одну страницу, новые письма сначала: `data`, `has_more` и `next_cursor`
+— как в API. Следующая страница — тот же вызов с `cursor: page.next_cursor`; курсор
+непрозрачный, передавайте его как есть. Фильтры: `status`, `from_email`, `to_email`, `tag`,
+`from`, `to` (строка ISO или `Date`), `limit` (размер страницы, 1..100), `cursor`.
+
+Обойти все страницы сразу — `listAll()`, асинхронный итератор:
+
+```ts
+for await (const email of client.emails.listAll({ status: "BOUNCED", limit: 100 })) {
+  console.log(email.id, email.to_emails);
+}
+```
+
+Страницы запрашиваются лениво, по мере обхода: `break` останавливает загрузку. `limit` —
+размер страницы, а не всей выборки; `cursor` продолжает обход с нужной страницы.
+
+> До 0.2.0 `list()` возвращал массив писем. Теперь это страница: письма — в `page.data`.
 
 ## Ошибки
 
@@ -188,6 +311,11 @@ try {
 — это и `UnprocessableError` (422), `SandboxTrialExhaustedError` — и
 `PermissionDeniedError` (403). Ловить можно на любом уровне: `MailInfraError`,
 класс статуса или конкретная причина.
+
+Классы отложенной отправки и доступа: `EmailNotScheduledError` (`409`) — письмо уже не
+запланировано, `SendAtTooFarError` и `SendAtInvalidError` (`400`) — `send_at` дальше 7 дней
+или без часового пояса, `IPNotAllowedError` (`403`) — ключ использован с IP-адреса вне его
+белого списка.
 
 Неизвестный код ошибки (новый на бэкенде) приходит как класс по HTTP-статусу, а не
 ломает старый SDK.
@@ -267,6 +395,16 @@ app.post(
 `constructEvent` проверяет HMAC-SHA256 подпись и её возраст (по умолчанию 5 минут, как
 на стороне MailInfra) и только потом разбирает JSON. Нужен просто флаг — есть
 `verify(...) => Promise<boolean>`.
+
+Во время ротации secret MailInfra подписывает каждую доставку дважды — новым secret и
+прежним: `t=<unix>,v1=<новым>,v1=<прежним>`. `verify` и `constructEvent` принимают запрос,
+если с вашим secret совпала **любая** из подписей, поэтому обработчик можно переключить на
+новый secret в любой момент окна ротации. (SDK 0.1.0 сверял только последнюю подпись —
+прежним secret, — и обработчик с новым secret отвергал доставки до конца окна.)
+
+У событий письма `type` — `email.<событие>`: в том числе `email.scheduled` при отложенной
+отправке и `email.canceled` при её отмене. `data.email.metadata` — `metadata`, переданный
+при отправке.
 
 Тело обязательно брать **до** разбора JSON: пересериализованный JSON даст другие байты
 и подпись не сойдётся.

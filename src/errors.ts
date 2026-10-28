@@ -157,6 +157,27 @@ export class SandboxRecipientNotAllowedError extends UnprocessableError {}
 /** `403` — пробная sandbox-отправка уже израсходована; нужен свой домен. */
 export class SandboxTrialExhaustedError extends PermissionDeniedError {}
 
+/**
+ * `403` — API-ключ использован с IP-адреса вне его белого списка.
+ *
+ * Список задаётся у ключа в дашборде. Повтор с того же адреса не поможет —
+ * нужен другой ключ или правка списка.
+ */
+export class IPNotAllowedError extends PermissionDeniedError {}
+
+/**
+ * `409` — письмо уже не запланировано: отправлено, отправляется или
+ * отменено, поэтому `cancel()` и `reschedule()` к нему неприменимы.
+ * Текущий статус письма — в `details.status`.
+ */
+export class EmailNotScheduledError extends ConflictError {}
+
+/** `400` — `send_at` дальше 7 дней от приёма письма (`details.max_days`). */
+export class SendAtTooFarError extends BadRequestError {}
+
+/** `400` — `send_at` без часового пояса. */
+export class SendAtInvalidError extends BadRequestError {}
+
 /** `422` — шаблон не отрендерился. */
 export class TemplateRenderError extends UnprocessableError {}
 
@@ -190,8 +211,9 @@ const STATUS_ERRORS = new Map<number, ErrorConstructor>([
 
 // Коды, которые бэкенд кладёт в `details.code` при отказе отправки.
 // Источник истины — места `raise` в `app.services.{email_service,
-// template_service, idempotency, rate_limit}`: только они говорят, какой код
-// реально выбрасывается и с каким статусом.
+// template_service, idempotency, rate_limit, scheduled_email_service}` и
+// `app.api.api_auth`: только они говорят, какой код реально выбрасывается и
+// с каким статусом.
 //
 // Именно `Map`, а не объектный литерал: ключ приходит из тела ответа, то есть
 // снаружи. У литерала `"toString" in CODE_ERRORS` истинно по цепочке
@@ -203,12 +225,16 @@ const CODE_ERRORS = new Map<string, ErrorConstructor>([
   ["all_recipients_suppressed", AllRecipientsSuppressedError],
   ["domain_not_attached", DomainNotAttachedError],
   ["domain_not_verified", DomainNotVerifiedError],
+  ["email_not_scheduled", EmailNotScheduledError],
   ["idempotency_in_flight", IdempotencyInFlightError],
+  ["ip_not_allowed", IPNotAllowedError],
   ["legal_documents_not_accepted", LegalDocumentsNotAcceptedError],
   ["reserved_email_header", ReservedEmailHeaderError],
   ["rps_exceeded", RateLimitError],
   ["sandbox_recipient_not_allowed", SandboxRecipientNotAllowedError],
   ["sandbox_trial_exhausted", SandboxTrialExhaustedError],
+  ["send_at_invalid", SendAtInvalidError],
+  ["send_at_too_far", SendAtTooFarError],
   ["template_render_error", TemplateRenderError],
   ["template_variable_missing", TemplateVariableMissingError],
 ]);

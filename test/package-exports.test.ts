@@ -4,14 +4,23 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+import { VERSION } from "../src/index.js";
+
 interface ConditionalExport {
   types?: string;
   default?: string;
 }
 
 const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+  version: string;
   exports: { ".": { import: ConditionalExport | string; require: ConditionalExport | string } };
 };
+
+describe("версия", () => {
+  it("VERSION совпадает с package.json — она уезжает в User-Agent", () => {
+    expect(VERSION).toBe(pkg.version);
+  });
+});
 
 describe("package.json exports", () => {
   it("import и require — со своими types", () => {

@@ -11,6 +11,8 @@
  *    в нём есть все пути и operationId.
  * 3. Проверяется, что спека описывает заголовки, на которые опирается
  *    клиент (`Retry-After`, `Idempotent-Replayed`, `Idempotency-Key`).
+ * 4. Каждая операция спеки вызывается методом SDK, и запрос этого метода —
+ *    метод, путь, query, заголовки и тело — сверяется с описанием операции.
  */
 
 import { readFileSync } from "node:fs";
@@ -29,38 +31,58 @@ const addFormats = ((addFormatsModule as unknown as { default?: typeof addFormat
   .default ?? addFormatsModule) as typeof addFormatsModule;
 
 import {
+  BATCH_IDEMPOTENCY_KEY_MAX_LENGTH,
   buildSendPayload,
   IDEMPOTENCY_KEY_MAX_LENGTH,
+  MailInfra,
   MailInfraError,
   MAX_ATTACHMENT_BASE64_LENGTH,
   MAX_ATTACHMENTS,
   MAX_BATCH_SIZE,
+  MAX_CONTENT_ID_LENGTH,
   MAX_CONTENT_TYPE_LENGTH,
   MAX_FILENAME_LENGTH,
   MAX_FROM_NAME_LENGTH,
+  MAX_METADATA_KEYS,
+  MAX_METADATA_VALUE_LENGTH,
   MAX_RECIPIENTS,
   MAX_REPLY_TO,
   MAX_SUBJECT_LENGTH,
   MAX_TAGS,
   MAX_TEMPLATE_LENGTH,
+  MAX_TTL_SECONDS,
+  MIN_TTL_SECONDS,
 } from "../src/index.js";
 import { sharedFile } from "./sharedFile.js";
+
+interface SpecParameter {
+  in?: string;
+  name?: string;
+  schema?: { maxLength?: number };
+}
+
+interface SpecOperation {
+  operationId?: string;
+  parameters?: SpecParameter[];
+  requestBody?: { content: Record<string, { schema: { $ref?: string } }> };
+}
 
 const specPath = sharedFile("mailinfra-public.json", "openapi");
 const generatedPath = fileURLToPath(new URL("../src/generated/openapi.d.ts", import.meta.url));
 
 const spec = JSON.parse(readFileSync(specPath, "utf-8")) as {
-  paths: Record<string, Record<string, { operationId?: string; parameters?: unknown[] }>>;
+  paths: Record<string, Record<string, SpecOperation>>;
   components: { schemas: Record<string, unknown>; securitySchemes: Record<string, unknown> };
   servers: { url: string }[];
 };
 const generated = readFileSync(generatedPath, "utf-8");
 
+let ajv: InstanceType<typeof Ajv2020>;
 let validateSendRequest: (data: unknown) => boolean;
 let sendRequestErrors: () => string;
 
 beforeAll(() => {
-  const ajv = new Ajv2020({ strict: false, allErrors: true });
+  ajv = new Ajv2020({ strict: false, allErrors: true });
   addFormats(ajv);
   ajv.addSchema(spec, "spec");
 
@@ -68,6 +90,12 @@ beforeAll(() => {
   validateSendRequest = validator as unknown as (data: unknown) => boolean;
   sendRequestErrors = () => ajv.errorsText(validator.errors);
 });
+
+/** Проверяет значение по схеме из спеки; ошибки ajv — в тексте провала. */
+function expectValid(ref: string, data: unknown): void {
+  const validator = ajv.compile({ $ref: `spec${ref}` });
+  expect(validator(data), ajv.errorsText(validator.errors)).toBe(true);
+}
 
 describe("тело запроса против схемы спеки", () => {
   it("минимальное письмо валидно", () => {
@@ -95,9 +123,31 @@ describe("тело запроса против схемы спеки", () => {
       headers: { "X-Campaign": "spring" },
       tags: ["order", "transactional"],
       variables: { user_name: "Анна" },
+      metadata: { order_id: "4242", "user.id": "u-1" },
+      send_at: new Date("2026-11-01T06:00:00Z"),
+      ttl: MAX_TTL_SECONDS,
       attachments: [
         { filename: "bill.pdf", content: new Uint8Array([1, 2, 3]), content_type: "application/pdf" },
+        {
+          filename: "logo.png",
+          content: new Uint8Array([137, 80, 78, 71]),
+          content_type: "image/png",
+          content_id: "logo@mail.example.ru",
+        },
       ],
+    });
+
+    expect(validateSendRequest(payload), sendRequestErrors()).toBe(true);
+  });
+
+  it("send_at строкой со смещением валиден", () => {
+    const payload = buildSendPayload({
+      from: "hello@mail.example.ru",
+      to: "user@example.com",
+      subject: "Тема",
+      text: "Текст",
+      send_at: "2026-11-01T09:00:00+03:00",
+      ttl: MIN_TTL_SECONDS,
     });
 
     expect(validateSendRequest(payload), sendRequestErrors()).toBe(true);
@@ -159,14 +209,17 @@ describe("сгенерированные типы соответствуют с�
 });
 
 describe("спека описывает то, на что опирается клиент", () => {
-  it("Idempotency-Key объявлен только у POST /emails", () => {
+  it("Idempotency-Key объявлен только у POST /emails и POST /emails/batch", () => {
+    // SDK ставит ключ ровно на эти два вызова: появится заголовок у другой
+    // операции — тест покраснеет и напомнит, что SDK его не шлёт.
+    const withKey = new Set(["post /emails", "post /emails/batch"]);
     for (const [path, item] of Object.entries(spec.paths)) {
       for (const [method, operation] of Object.entries(item)) {
-        const headers = ((operation.parameters ?? []) as { in?: string; name?: string }[])
+        const headers = (operation.parameters ?? [])
           .filter((parameter) => parameter.in === "header")
           .map((parameter) => parameter.name);
-        const expected = path === "/emails" && method === "post" ? ["Idempotency-Key"] : [];
-        expect(headers).toEqual(expected);
+        const expected = withKey.has(`${method} ${path}`) ? ["Idempotency-Key"] : [];
+        expect(headers, `${method} ${path}`).toEqual(expected);
       }
     }
   });
@@ -199,7 +252,18 @@ describe("таблица лимитов совпадает со спекой", (
   // `SpecParityTest.php` в PHP.
   const schemas = spec.components.schemas as Record<
     string,
-    { properties?: Record<string, { maxItems?: number; maxLength?: number }> }
+    {
+      properties?: Record<
+        string,
+        {
+          maxItems?: number;
+          maxLength?: number;
+          minimum?: number;
+          maximum?: number;
+          description?: string;
+        }
+      >;
+    }
   >;
 
   it.each([
@@ -251,17 +315,138 @@ describe("таблица лимитов совпадает со спекой", (
       "maxLength",
       MAX_ATTACHMENT_BASE64_LENGTH,
     ],
+    [
+      "EmailAttachmentInput.content_id",
+      "EmailAttachmentInput",
+      "content_id",
+      "maxLength",
+      MAX_CONTENT_ID_LENGTH,
+    ],
+    ["EmailSendRequest.ttl minimum", "EmailSendRequest", "ttl", "minimum", MIN_TTL_SECONDS],
+    ["EmailSendRequest.ttl maximum", "EmailSendRequest", "ttl", "maximum", MAX_TTL_SECONDS],
     ["BatchSendRequest.emails", "BatchSendRequest", "emails", "maxItems", MAX_BATCH_SIZE],
   ] as const)("%s", (_label, schema, field, key, expected) => {
     expect(schemas[schema]?.properties?.[field]?.[key]).toBe(expected);
   });
 
-  it("Idempotency-Key ограничен тем же числом", () => {
-    const parameters = spec.paths["/emails"]?.post?.parameters as
-      | { name?: string; schema?: { maxLength?: number } }[]
-      | undefined;
-    const header = parameters?.find((item) => item.name === "Idempotency-Key");
+  it.each([
+    ["POST /emails", "/emails", IDEMPOTENCY_KEY_MAX_LENGTH],
+    ["POST /emails/batch", "/emails/batch", BATCH_IDEMPOTENCY_KEY_MAX_LENGTH],
+  ])("Idempotency-Key у %s ограничен тем же числом", (_label, path, expected) => {
+    const header = spec.paths[path]?.post?.parameters?.find(
+      (item) => item.name === "Idempotency-Key",
+    );
 
-    expect(header?.schema?.maxLength).toBe(IDEMPOTENCY_KEY_MAX_LENGTH);
+    expect(header?.schema?.maxLength).toBe(expected);
+  });
+
+  it("лимиты metadata — те же, что в описании поля", () => {
+    // Схема `metadata` — просто объект строк, без maxProperties и maxLength:
+    // число ключей и длину значения спека называет только словами.
+    const description = schemas["EmailSendRequest"]?.properties?.["metadata"]?.description ?? "";
+
+    expect(description).toContain(`До ${MAX_METADATA_KEYS} ключей`);
+    expect(description).toContain(`до ${MAX_METADATA_VALUE_LENGTH} символов`);
+  });
+});
+
+describe("каждая операция спеки покрыта методом SDK", () => {
+  const BASE_URL = "https://api.mailinfra.test/v1";
+  const API_KEY = "mi_test_0123456789abcdef0123456789abcdef";
+  const EMAIL_ID = "018e1b7a-1111-7000-aaaa-111111111111";
+  const MINIMAL = {
+    from: "hello@mail.example.ru",
+    to: "user@example.com",
+    subject: "Тема",
+    text: "Текст",
+    metadata: { order_id: "4242" },
+  };
+
+  interface Sent {
+    method: string;
+    url: URL;
+    headers: Record<string, string>;
+    body: unknown;
+  }
+
+  /** Клиент, который записывает запрос и отвечает тем, что годится любому методу. */
+  function recordingClient(): { client: MailInfra; sent: Sent[] } {
+    const sent: Sent[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init: RequestInit = {}) => {
+      sent.push({
+        method: init.method ?? "GET",
+        url: new URL(String(url)),
+        headers: (init.headers ?? {}) as Record<string, string>,
+        body: init.body === undefined ? undefined : JSON.parse(String(init.body)),
+      });
+      // `data` есть, а страница списка последняя — разбор любого ответа пройдёт.
+      return new Response(JSON.stringify({ data: [], has_more: false, next_cursor: null }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof globalThis.fetch;
+    return { client: new MailInfra({ apiKey: API_KEY, baseUrl: BASE_URL, fetch: fetchImpl }), sent };
+  }
+
+  const SDK_CALLS: Record<string, (client: MailInfra) => Promise<unknown>> = {
+    send_email: (client) => client.emails.send({ ...MINIMAL, send_at: new Date(), ttl: 600 }),
+    send_batch: (client) => client.emails.sendBatch([MINIMAL, MINIMAL]),
+    list_emails: (client) =>
+      client.emails.list({ status: "SCHEDULED", limit: 10, cursor: "c2VlZA", from: new Date() }),
+    get_email: (client) => client.emails.get(EMAIL_ID),
+    list_email_events: (client) => client.emails.events(EMAIL_ID),
+    cancel_email: (client) => client.emails.cancel(EMAIL_ID),
+    reschedule_email: (client) =>
+      client.emails.reschedule(EMAIL_ID, { send_at: "2026-11-01T09:00:00+03:00" }),
+  };
+
+  /** Операция спеки, в которую попадает запрос с таким методом и путём. */
+  function findOperation(method: string, path: string): SpecOperation | undefined {
+    for (const [template, item] of Object.entries(spec.paths)) {
+      const pattern = new RegExp(`^${template.replace(/\{[^}]+\}/g, "[^/]+")}$`);
+      const operation = item[method.toLowerCase()];
+      if (operation !== undefined && pattern.test(path)) {
+        return operation;
+      }
+    }
+    return undefined;
+  }
+
+  it("у каждой операции спеки есть метод SDK, и наоборот", () => {
+    const operationIds = Object.values(spec.paths).flatMap((item) =>
+      Object.values(item).map((operation) => operation.operationId),
+    );
+
+    expect(Object.keys(SDK_CALLS).sort()).toEqual(operationIds.sort());
+  });
+
+  it.each(Object.entries(SDK_CALLS))("%s: метод, путь, query, заголовки и тело — по спеке", async (
+    operationId,
+    call,
+  ) => {
+    const { client, sent } = recordingClient();
+    await call(client);
+
+    expect(sent).toHaveLength(1);
+    const request = sent[0]!;
+    const path = request.url.pathname.slice(new URL(BASE_URL).pathname.length);
+    const operation = findOperation(request.method, path);
+    expect(operation?.operationId, `${request.method} ${path}`).toBe(operationId);
+
+    const declared = (kind: string): (string | undefined)[] =>
+      (operation?.parameters ?? []).filter((item) => item.in === kind).map((item) => item.name);
+    for (const name of request.url.searchParams.keys()) {
+      expect(declared("query")).toContain(name);
+    }
+    if ("Idempotency-Key" in request.headers) {
+      expect(declared("header")).toContain("Idempotency-Key");
+    }
+
+    const bodyRef = operation?.requestBody?.content["application/json"]?.schema.$ref;
+    if (bodyRef === undefined) {
+      expect(request.body).toBeUndefined();
+    } else {
+      expectValid(bodyRef, request.body);
+    }
   });
 });
